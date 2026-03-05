@@ -5,7 +5,7 @@ from typing import Optional, Literal, List
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import (
-    create_engine, Column, BigInteger, Text, Integer, Real, DateTime, Index
+    create_engine, Column, BigInteger, Text, Integer, Float, DateTime, Index
 )
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -34,8 +34,8 @@ class Reading(Base):
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     device_id = Column(Text, nullable=False)
     ts = Column(DateTime(timezone=True), nullable=False)
-    temp_c = Column(Real, nullable=True)
-    hum_air = Column(Real, nullable=True)
+    temp_c = Column(Float, nullable=True)
+    hum_air = Column(Float, nullable=True)
     ldr_raw = Column(Integer, nullable=True)
     soil_percent = Column(Integer, nullable=True)
     rain = Column(Text, nullable=True)  # "rain" | "dry"
