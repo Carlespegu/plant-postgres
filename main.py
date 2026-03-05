@@ -16,7 +16,15 @@ API_KEY = os.environ.get("API_KEY", "")        # set in Render env vars
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# Render usually provides postgresql://... ; SQLAlchemy + psycopg2 uses postgresql+psycopg2://
+if DATABASE_URL.startswith("postgresql://"):
+    SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
+elif DATABASE_URL.startswith("postgres://"):
+    SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgres://"):]
+else:
+    SQLALCHEMY_DATABASE_URL = DATABASE_URL
+
+engine = create_engine(SQLALCHEMY_DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
