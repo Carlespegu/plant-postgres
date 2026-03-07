@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timezone
 from typing import Optional, Literal, List
+from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -68,7 +69,18 @@ class ReadingOut(BaseModel):
     rain: Optional[str]
     rssi: Optional[int]
 
-app = FastAPI(title="Plant Station API", version="1.0.0")
+app = FastAPI(
+    title="Plant Station API",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def require_api_key(x_api_key: Optional[str]):
     # If API_KEY not set, allow early tests. Set it in Render for production.
