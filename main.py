@@ -68,7 +68,7 @@ class ReadingOut(BaseModel):
     soilPercent: Optional[int]
     rain: Optional[str]
     rssi: Optional[int]
-
+ 
 app = FastAPI(
     title="Plant Station API",
     version="1.0.0"
