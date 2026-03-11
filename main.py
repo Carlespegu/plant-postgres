@@ -71,15 +71,11 @@ class AlertDB(Base):
     __tablename__ = "alerts"
 
     id = Column(Integer, primary_key=True, index=True)
-    deviceId = Column(String(100), nullable=False, index=True)
-    alertType = Column(String(50), nullable=False, index=True)
-    subject = Column(String(255), nullable=False)
-    message = Column(Text, nullable=False)
-    soilPercent = Column(Float, nullable=True)
-    sentTo = Column(String(255), nullable=True)
-    resendId = Column(String(255), nullable=True)
-    createdAt = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
-
+    deviceId = Column("device_id", String(100), nullable=False, index=True)
+    alertType = Column("alert_type", String(50), nullable=False, index=True)
+    value = Column(Integer, nullable=True)
+    recipient = Column(String(255), nullable=True)
+    sentAt = Column("sent_at", DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
 
 def create_tables() -> None:
     Base.metadata.create_all(bind=engine)
@@ -205,7 +201,7 @@ def should_send_soil_alert(db: Session, device_id: str) -> bool:
     last_alert = (
         db.query(AlertDB)
         .filter(AlertDB.deviceId == device_id, AlertDB.alertType == "soil_low")
-        .order_by(AlertDB.createdAt.desc())
+        .order_by(AlertDB.sentAt.desc())
         .first()
     )
 
@@ -213,11 +209,11 @@ def should_send_soil_alert(db: Session, device_id: str) -> bool:
         return True
 
     # Compatibilitat si la datetime ve sense tz
-    last_created = last_alert.createdAt
-    if last_created.tzinfo is None:
-        last_created = last_created.replace(tzinfo=timezone.utc)
+     last_sent = last_alert.sentAt
+    if last_sent.tzinfo is None:
+        last_sent = last_sent.replace(tzinfo=timezone.utc)
 
-    return last_created <= cooldown_limit
+    return last_sent <= cooldown_limit
 
 
 def maybe_send_soil_alert(db: Session, reading: ReadingDB) -> None:
@@ -252,11 +248,8 @@ def maybe_send_soil_alert(db: Session, reading: ReadingDB) -> None:
     alert = AlertDB(
         deviceId=reading.deviceId,
         alertType="soil_low",
-        subject=subject,
-        message=text,
-        soilPercent=reading.soilPercent,
-        sentTo=ALERT_TO_EMAIL,
-        resendId=resend_id,
+        value=int(reading.soilPercent) if reading.soilPercent is not None else None,
+        recipient=ALERT_TO_EMAIL,
     )
     db.add(alert)
     db.commit()
