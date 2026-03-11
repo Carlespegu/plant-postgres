@@ -1,9 +1,8 @@
 import os
-import smtplib
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 from typing import Literal, Optional
 
+import resend
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -24,11 +23,8 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 DATABASE_URL = os.environ.get("DATABASE_URL")
 API_KEY = os.environ.get("API_KEY", "")
 
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USER = os.environ.get("SMTP_USER", "")
-SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
-ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", SMTP_USER)
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "")
 ALERT_TO_EMAIL = os.environ.get("ALERT_TO_EMAIL", "")
 
 SOIL_ALERT_THRESHOLD = int(os.environ.get("SOIL_ALERT_THRESHOLD", "25"))
@@ -37,7 +33,7 @@ ALERT_COOLDOWN_HOURS = int(os.environ.get("ALERT_COOLDOWN_HOURS", "12"))
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var is required")
 
-# Render + psycopg2
+# SQLAlchemy + psycopg2 for Render/Postgres
 if DATABASE_URL.startswith("postgresql://"):
     SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
 elif DATABASE_URL.startswith("postgres://"):
@@ -49,9 +45,11 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_pre_ping=True,
 )
-
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
+
+# Resend SDK
+resend.api_key = RESEND_API_KEY
 
 # =========================
 # DB MODELS
@@ -139,17 +137,29 @@ def require_api_key(x_api_key: Optional[str]):
         raise HTTPException(status_code=401, detail="Invalid API key")
 
 
-def send_email_alert(device_id: str, soil_percent: int, temp_c: Optional[float], hum_air: Optional[float], ts: datetime) -> bool:
-    if not SMTP_USER or not SMTP_PASSWORD or not ALERT_TO_EMAIL:
-        print("Email alert skipped: missing SMTP config")
+def send_email_alert(
+    device_id: str,
+    soil_percent: int,
+    temp_c: Optional[float],
+    hum_air: Optional[float],
+    ts: datetime,
+) -> bool:
+    if not RESEND_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAIL:
+        print("Email alert skipped: missing Resend config")
         return False
 
-    msg = EmailMessage()
-    msg["Subject"] = f"Alerta de reg - {device_id}"
-    msg["From"] = ALERT_FROM_EMAIL
-    msg["To"] = ALERT_TO_EMAIL
+    subject = f"Alerta de reg - {device_id}"
+    html = f"""
+    <h2>La planta necessita atenció</h2>
+    <p><b>Dispositiu:</b> {device_id}</p>
+    <p><b>Humitat del sòl:</b> {soil_percent}%</p>
+    <p><b>Temperatura:</b> {temp_c if temp_c is not None else 'N/D'} °C</p>
+    <p><b>Humitat aire:</b> {hum_air if hum_air is not None else 'N/D'} %</p>
+    <p><b>Hora:</b> {ts.isoformat()}</p>
+    <p><b>Recomanació:</b> cal regar la planta.</p>
+    """
 
-    body = f"""
+    text = f"""
 La planta necessita atenció.
 
 Dispositiu: {device_id}
@@ -161,13 +171,22 @@ Hora: {ts.isoformat()}
 Recomanació: cal regar la planta.
 """.strip()
 
-    msg.set_content(body)
+    try:
+        params = {
+            "from": ALERT_FROM_EMAIL,
+            "to": [ALERT_TO_EMAIL],
+            "subject": subject,
+            "html": html,
+            "text": text,
+        }
 
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
-        smtp.login(SMTP_USER, SMTP_PASSWORD)
-        smtp.send_message(msg)
+        email = resend.Emails.send(params)
+        print("Resend email sent:", email)
+        return True
 
-    return True
+    except Exception as e:
+        print(f"Resend email failed: {e}")
+        return False
 
 
 def should_send_soil_alert(db, device_id: str) -> bool:
