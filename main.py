@@ -1,327 +1,346 @@
 import os
+import json
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import Literal, Optional
+from typing import Optional, List
 
-import resend
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Depends, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import (
-    BigInteger,
-    Column,
-    DateTime,
-    Index,
-    Integer,
-    Text,
     create_engine,
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    Text,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
-# =========================
-# ENV VARS
-# =========================
-DATABASE_URL = os.environ.get("DATABASE_URL")
-API_KEY = os.environ.get("API_KEY", "")
 
-RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-ALERT_FROM_EMAIL = os.environ.get("ALERT_FROM_EMAIL", "")
-ALERT_TO_EMAIL = os.environ.get("ALERT_TO_EMAIL", "")
+# ------------------------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("plant-station")
 
-SOIL_ALERT_THRESHOLD = int(os.environ.get("SOIL_ALERT_THRESHOLD", "25"))
-ALERT_COOLDOWN_HOURS = int(os.environ.get("ALERT_COOLDOWN_HOURS", "12"))
+
+# ------------------------------------------------------------------------------
+# Env config
+# ------------------------------------------------------------------------------
+DATABASE_URL = os.getenv("DATABASE_URL")
+API_KEY = os.getenv("API_KEY", "")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
+ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL", "Plant Station <onboarding@resend.dev>")
+ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "")
+SOIL_ALERT_THRESHOLD = float(os.getenv("SOIL_ALERT_THRESHOLD", "25"))
+ALERT_COOLDOWN_HOURS = int(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL env var is required")
+    raise RuntimeError("Missing DATABASE_URL environment variable")
 
-# SQLAlchemy + psycopg2 for Render/Postgres
-if DATABASE_URL.startswith("postgresql://"):
-    SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgresql://"):]
-elif DATABASE_URL.startswith("postgres://"):
-    SQLALCHEMY_DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[len("postgres://"):]
-else:
-    SQLALCHEMY_DATABASE_URL = DATABASE_URL
+# Alguns proveïdors retornen postgres:// i SQLAlchemy prefereix postgresql://
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,
-    pool_pre_ping=True,
-)
+
+# ------------------------------------------------------------------------------
+# DB
+# ------------------------------------------------------------------------------
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
 
-# Resend SDK
-resend.api_key = RESEND_API_KEY
 
-# =========================
-# DB MODELS
-# =========================
-class Reading(Base):
+class ReadingDB(Base):
     __tablename__ = "readings"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    device_id = Column(Text, nullable=False)
-    ts = Column(DateTime(timezone=True), nullable=False)
-    temp_c = Column(Integer, nullable=True)
-    hum_air = Column(Integer, nullable=True)
-    ldr_raw = Column(Integer, nullable=True)
-    soil_percent = Column(Integer, nullable=True)
-    rain = Column(Text, nullable=True)   # "rain" | "dry"
+    id = Column(Integer, primary_key=True, index=True)
+    deviceId = Column(String(100), nullable=False, index=True)
+    ts = Column(DateTime(timezone=True), nullable=False, index=True, default=lambda: datetime.now(timezone.utc))
+    tempC = Column(Float, nullable=True)
+    humAir = Column(Float, nullable=True)
+    ldrRaw = Column(Integer, nullable=True)
+    soilPercent = Column(Float, nullable=True)
+    rain = Column(Float, nullable=True)
     rssi = Column(Integer, nullable=True)
 
 
-class Alert(Base):
+class AlertDB(Base):
     __tablename__ = "alerts"
 
-    id = Column(BigInteger, primary_key=True, autoincrement=True)
-    device_id = Column(Text, nullable=False)
-    alert_type = Column(Text, nullable=False)   # e.g. "soil_low"
-    value = Column(Integer, nullable=True)
-    recipient = Column(Text, nullable=True)
-    sent_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    id = Column(Integer, primary_key=True, index=True)
+    deviceId = Column(String(100), nullable=False, index=True)
+    alertType = Column(String(50), nullable=False, index=True)
+    subject = Column(String(255), nullable=False)
+    message = Column(Text, nullable=False)
+    soilPercent = Column(Float, nullable=True)
+    sentTo = Column(String(255), nullable=True)
+    resendId = Column(String(255), nullable=True)
+    createdAt = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), index=True)
 
 
-Index("idx_readings_device_ts", Reading.device_id, Reading.ts.desc())
-Index("idx_alerts_device_type_sent_at", Alert.device_id, Alert.alert_type, Alert.sent_at.desc())
-
-Base.metadata.create_all(bind=engine)
-
-# =========================
-# SCHEMAS
-# =========================
-RainType = Literal["rain", "dry"]
+def create_tables() -> None:
+    Base.metadata.create_all(bind=engine)
 
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ------------------------------------------------------------------------------
+# Schemas
+# ------------------------------------------------------------------------------
 class ReadingIn(BaseModel):
-    deviceId: str = Field(min_length=1, max_length=64)
+    deviceId: str
     ts: Optional[datetime] = None
     tempC: Optional[float] = None
     humAir: Optional[float] = None
-    ldrRaw: Optional[int] = Field(default=None, ge=0, le=4095)
-    soilPercent: Optional[int] = Field(default=None, ge=0, le=100)
-    rain: Optional[RainType] = None
-    rssi: Optional[int] = Field(default=None, ge=-120, le=0)
+    ldrRaw: Optional[int] = None
+    soilPercent: Optional[float] = None
+    rain: Optional[float] = None
+    rssi: Optional[int] = None
 
 
 class ReadingOut(BaseModel):
     id: int
     deviceId: str
     ts: datetime
-    tempC: Optional[float]
-    humAir: Optional[float]
-    ldrRaw: Optional[int]
-    soilPercent: Optional[int]
-    rain: Optional[str]
-    rssi: Optional[int]
+    tempC: Optional[float] = None
+    humAir: Optional[float] = None
+    ldrRaw: Optional[int] = None
+    soilPercent: Optional[float] = None
+    rain: Optional[float] = None
+    rssi: Optional[int] = None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
-# =========================
-# APP
-# =========================
-app = FastAPI(
-    title="Plant Station API",
-    version="1.0.0"
-)
+class HealthOut(BaseModel):
+    status: str
+
+
+# ------------------------------------------------------------------------------
+# Security
+# ------------------------------------------------------------------------------
+def require_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if not API_KEY:
+        logger.warning("API_KEY not configured in environment")
+        raise HTTPException(status_code=500, detail="Server API key is not configured")
+
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+# ------------------------------------------------------------------------------
+# Email / Resend
+# ------------------------------------------------------------------------------
+def parse_recipients(raw_value: str) -> List[str]:
+    return [x.strip() for x in raw_value.split(",") if x.strip()]
+
+
+def send_email_with_resend(subject: str, html: str, text: str = "") -> Optional[str]:
+    """
+    Envia email via Resend REST API.
+    Retorna resend email id si tot va bé.
+    """
+    if not RESEND_API_KEY:
+        logger.warning("Email alert skipped: missing RESEND_API_KEY")
+        return None
+
+    recipients = parse_recipients(ALERT_TO_EMAIL)
+    if not recipients:
+        logger.warning("Email alert skipped: missing ALERT_TO_EMAIL")
+        return None
+
+    payload = {
+        "from": ALERT_FROM_EMAIL,
+        "to": recipients,
+        "subject": subject,
+        "html": html,
+        "text": text or subject,
+    }
+
+    request = Request(
+        url="https://api.resend.com/emails",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8")
+            data = json.loads(body) if body else {}
+            resend_id = data.get("id")
+            logger.info("Email sent via Resend. resend_id=%s", resend_id)
+            return resend_id
+
+    except HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="ignore")
+        logger.exception("Resend HTTPError: %s - %s", e.code, error_body)
+        return None
+    except URLError as e:
+        logger.exception("Resend URLError: %s", str(e))
+        return None
+    except Exception:
+        logger.exception("Unexpected error sending email with Resend")
+        return None
+
+
+# ------------------------------------------------------------------------------
+# Alert logic
+# ------------------------------------------------------------------------------
+def should_send_soil_alert(db: Session, device_id: str) -> bool:
+    cooldown_limit = datetime.now(timezone.utc) - timedelta(hours=ALERT_COOLDOWN_HOURS)
+
+    last_alert = (
+        db.query(AlertDB)
+        .filter(AlertDB.deviceId == device_id, AlertDB.alertType == "soil_low")
+        .order_by(AlertDB.createdAt.desc())
+        .first()
+    )
+
+    if not last_alert:
+        return True
+
+    # Compatibilitat si la datetime ve sense tz
+    last_created = last_alert.createdAt
+    if last_created.tzinfo is None:
+        last_created = last_created.replace(tzinfo=timezone.utc)
+
+    return last_created <= cooldown_limit
+
+
+def maybe_send_soil_alert(db: Session, reading: ReadingDB) -> None:
+    if reading.soilPercent is None:
+        return
+
+    if reading.soilPercent >= SOIL_ALERT_THRESHOLD:
+        return
+
+    if not should_send_soil_alert(db, reading.deviceId):
+        logger.info("Soil alert skipped due to cooldown for device=%s", reading.deviceId)
+        return
+
+    subject = f"Alerta planta: humitat baixa ({reading.deviceId})"
+    text = (
+        f"S'ha detectat humitat baixa al dispositiu {reading.deviceId}. "
+        f"Valor actual: {reading.soilPercent}%. "
+        f"Llindar configurat: {SOIL_ALERT_THRESHOLD}%."
+    )
+    html = f"""
+    <h2>Alerta de planta</h2>
+    <p><strong>Dispositiu:</strong> {reading.deviceId}</p>
+    <p><strong>Humitat sòl:</strong> {reading.soilPercent}%</p>
+    <p><strong>Llindar:</strong> {SOIL_ALERT_THRESHOLD}%</p>
+    <p><strong>Temperatura:</strong> {reading.tempC if reading.tempC is not None else "-"}</p>
+    <p><strong>Humitat aire:</strong> {reading.humAir if reading.humAir is not None else "-"}</p>
+    <p><strong>Timestamp:</strong> {reading.ts.isoformat()}</p>
+    """
+
+    resend_id = send_email_with_resend(subject=subject, html=html, text=text)
+
+    alert = AlertDB(
+        deviceId=reading.deviceId,
+        alertType="soil_low",
+        subject=subject,
+        message=text,
+        soilPercent=reading.soilPercent,
+        sentTo=ALERT_TO_EMAIL,
+        resendId=resend_id,
+    )
+    db.add(alert)
+    db.commit()
+
+    if resend_id:
+        logger.info("Soil alert stored and email sent for device=%s", reading.deviceId)
+    else:
+        logger.warning("Soil alert stored but email could not be sent for device=%s", reading.deviceId)
+
+
+# ------------------------------------------------------------------------------
+# App
+# ------------------------------------------------------------------------------
+app = FastAPI(title="Plant Station API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # després ho pots restringir al domini del dashboard
+    allow_origins=["*"],  # després ho pots limitar al teu frontend Vite
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================
-# HELPERS
-# =========================
-def require_api_key(x_api_key: Optional[str]):
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+
+@app.on_event("startup")
+def startup():
+    create_tables()
+    logger.info("Plant Station API started")
 
 
-def send_email_alert(
-    device_id: str,
-    soil_percent: int,
-    temp_c: Optional[float],
-    hum_air: Optional[float],
-    ts: datetime,
-) -> bool:
-    if not RESEND_API_KEY or not ALERT_FROM_EMAIL or not ALERT_TO_EMAIL:
-        print("Email alert skipped: missing Resend config")
-        return False
-
-    subject = f"Alerta de reg - {device_id}"
-    html = f"""
-    <h2>La planta necessita atenció</h2>
-    <p><b>Dispositiu:</b> {device_id}</p>
-    <p><b>Humitat del sòl:</b> {soil_percent}%</p>
-    <p><b>Temperatura:</b> {temp_c if temp_c is not None else 'N/D'} °C</p>
-    <p><b>Humitat aire:</b> {hum_air if hum_air is not None else 'N/D'} %</p>
-    <p><b>Hora:</b> {ts.isoformat()}</p>
-    <p><b>Recomanació:</b> cal regar la planta.</p>
-    """
-
-    text = f"""
-La planta necessita atenció.
-
-Dispositiu: {device_id}
-Humitat del sòl: {soil_percent}%
-Temperatura: {temp_c if temp_c is not None else 'N/D'} °C
-Humitat aire: {hum_air if hum_air is not None else 'N/D'} %
-Hora: {ts.isoformat()}
-
-Recomanació: cal regar la planta.
-""".strip()
-
-    try:
-        params = {
-            "from": ALERT_FROM_EMAIL,
-            "to": [ALERT_TO_EMAIL],
-            "subject": subject,
-            "html": html,
-            "text": text,
-        }
-
-        email = resend.Emails.send(params)
-        print("Resend email sent:", email)
-        return True
-
-    except Exception as e:
-        print(f"Resend email failed: {e}")
-        return False
+@app.get("/health", response_model=HealthOut)
+def health():
+    return {"status": "ok"}
 
 
-def should_send_soil_alert(db, device_id: str) -> bool:
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=ALERT_COOLDOWN_HOURS)
+@app.post("/api/v1/readings", response_model=ReadingOut, dependencies=[Depends(require_api_key)])
+def create_reading(payload: ReadingIn, db: Session = Depends(get_db)):
+    reading_ts = payload.ts or datetime.now(timezone.utc)
 
-    recent = (
-        db.query(Alert)
-        .filter(Alert.device_id == device_id)
-        .filter(Alert.alert_type == "soil_low")
-        .filter(Alert.sent_at >= cutoff)
-        .order_by(Alert.sent_at.desc())
-        .first()
+    reading = ReadingDB(
+        deviceId=payload.deviceId,
+        ts=reading_ts,
+        tempC=payload.tempC,
+        humAir=payload.humAir,
+        ldrRaw=payload.ldrRaw,
+        soilPercent=payload.soilPercent,
+        rain=payload.rain,
+        rssi=payload.rssi,
     )
 
-    return recent is None
+    db.add(reading)
+    db.commit()
+    db.refresh(reading)
+
+    maybe_send_soil_alert(db, reading)
+
+    return reading
 
 
-# =========================
-# ROUTES
-# =========================
-@app.get("/")
-def root():
-    return {"ok": True, "service": "Plant Station API"}
-
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-@app.post("/api/v1/readings", response_model=ReadingOut)
-def create_reading(payload: ReadingIn, x_api_key: Optional[str] = Header(default=None)):
-    require_api_key(x_api_key)
-
-    ts = payload.ts
-    if ts is None:
-        ts = datetime.now(timezone.utc)
-    elif ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-
-    db = SessionLocal()
-    try:
-        row = Reading(
-            device_id=payload.deviceId,
-            ts=ts,
-            temp_c=int(payload.tempC) if payload.tempC is not None else None,
-            hum_air=int(payload.humAir) if payload.humAir is not None else None,
-            ldr_raw=payload.ldrRaw,
-            soil_percent=payload.soilPercent,
-            rain=payload.rain,
-            rssi=payload.rssi,
-        )
-        db.add(row)
-        db.commit()
-        db.refresh(row)
-
-        # ALERTA EMAIL
-        if (
-            payload.soilPercent is not None
-            and payload.soilPercent < SOIL_ALERT_THRESHOLD
-            and should_send_soil_alert(db, payload.deviceId)
-        ):
-            sent = send_email_alert(
-                device_id=payload.deviceId,
-                soil_percent=payload.soilPercent,
-                temp_c=payload.tempC,
-                hum_air=payload.humAir,
-                ts=ts,
-            )
-
-            if sent:
-                db.add(
-                    Alert(
-                        device_id=payload.deviceId,
-                        alert_type="soil_low",
-                        value=payload.soilPercent,
-                        recipient=ALERT_TO_EMAIL,
-                    )
-                )
-                db.commit()
-
-        return ReadingOut(
-            id=int(row.id),
-            deviceId=row.device_id,
-            ts=row.ts,
-            tempC=float(row.temp_c) if row.temp_c is not None else None,
-            humAir=float(row.hum_air) if row.hum_air is not None else None,
-            ldrRaw=row.ldr_raw,
-            soilPercent=row.soil_percent,
-            rain=row.rain,
-            rssi=row.rssi,
-        )
-    finally:
-        db.close()
-
-
-@app.get("/api/v1/readings")
+@app.get("/api/v1/readings", response_model=List[ReadingOut])
 def list_readings(
-    deviceId: str = Query(..., min_length=1, max_length=64),
-    limit: int = Query(200, ge=1, le=2000),
-    from_ts: Optional[datetime] = Query(None, alias="from"),
-    to_ts: Optional[datetime] = Query(None, alias="to"),
-    x_api_key: Optional[str] = Header(default=None),
+    deviceId: Optional[str] = Query(default=None),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db),
 ):
-    require_api_key(x_api_key)
+    query = db.query(ReadingDB)
 
-    if from_ts and from_ts.tzinfo is None:
-        from_ts = from_ts.replace(tzinfo=timezone.utc)
-    if to_ts and to_ts.tzinfo is None:
-        to_ts = to_ts.replace(tzinfo=timezone.utc)
+    if deviceId:
+        query = query.filter(ReadingDB.deviceId == deviceId)
 
-    db = SessionLocal()
-    try:
-        q = db.query(Reading).filter(Reading.device_id == deviceId)
+    rows = query.order_by(ReadingDB.ts.desc()).limit(limit).all()
+    return rows
 
-        if from_ts:
-            q = q.filter(Reading.ts >= from_ts)
-        if to_ts:
-            q = q.filter(Reading.ts <= to_ts)
 
-        rows = q.order_by(Reading.ts.desc()).limit(limit).all()
-
-        return [
-            {
-                "id": int(r.id),
-                "deviceId": r.device_id,
-                "ts": r.ts,
-                "tempC": float(r.temp_c) if r.temp_c is not None else None,
-                "humAir": float(r.hum_air) if r.hum_air is not None else None,
-                "ldrRaw": r.ldr_raw,
-                "soilPercent": r.soil_percent,
-                "rain": r.rain,
-                "rssi": r.rssi,
-            }
-            for r in rows
-        ]
-    finally:
-        db.close()
+@app.post("/api/v1/alerts/test")
+def test_alert(db: Session = Depends(get_db)):
+    fake_reading = ReadingDB(
+        deviceId="test-device",
+        ts=datetime.now(timezone.utc),
+        tempC=24,
+        humAir=50,
+        soilPercent=10,
+    )
+    maybe_send_soil_alert(db, fake_reading)
+    return {"ok": True, "message": "Test alert executed"}
