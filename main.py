@@ -32,6 +32,7 @@ ALERT_FROM_EMAIL = os.getenv("ALERT_FROM_EMAIL", "Plant Station <onboarding@rese
 ALERT_TO_EMAIL = os.getenv("ALERT_TO_EMAIL", "")
 SOIL_ALERT_THRESHOLD = float(os.getenv("SOIL_ALERT_THRESHOLD", "25"))
 ALERT_COOLDOWN_HOURS = int(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
+EMAIL_MODE = os.getenv("EMAIL_MODE", "resend")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
@@ -126,10 +127,15 @@ def require_api_key(x_api_key: Optional[str] = Header(default=None)):
 # ------------------------------
 
 def send_email(subject: str, html: str):
+    if EMAIL_MODE == "log":
+        logger.info("EMAIL TEST MODE | subject=%s | html=%s", subject, html)
+        return
 
     if not RESEND_API_KEY or not ALERT_TO_EMAIL:
         logger.warning("Email not configured")
         return
+
+    # crida real a Resend
 
     payload = {
         "from": ALERT_FROM_EMAIL,
