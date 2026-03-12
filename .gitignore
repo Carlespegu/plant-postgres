@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+
+# Virtual env
+venv/
+.env
+
+# Logs
+*.log
+
+# Node / React
+node_modules/
+plant-dashboard/node_modules/
+
+# Build frontend
+dist/
+build/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Environment variables
+.env.local
+.env.production
+
+# Python cache
+*.egg-info/
